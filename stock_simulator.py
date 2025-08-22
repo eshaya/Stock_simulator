@@ -9,9 +9,6 @@ import matplotlib.pyplot as plt
 
 def run_simulator(args):
     """Run the trading simulation using parameters from ``args``.
-
-    ``args`` is the result of ``argparse`` parsing and provides all user
-    configurable values such as the rebalance frequency and thresholds.
     """
     # ------------------------------------------------------------------
     # Load and filter price data for the desired date range. Each column
@@ -24,12 +21,19 @@ def run_simulator(args):
     # ------------------------------------------------------------------
     # Set up starting portfolio values.
     #   equity      - total account equity at the start of the simulation
-    #   cash        - uninvested portion of equity
     #   shares_held - mapping of ticker -> number of shares currently held
     # ------------------------------------------------------------------
     equity = args.init_equity
-    cash = equity * (1.0 - args.init_invest_fraction)
     shares_held = {t: 0.0 for t in tickers}
+
+    # ``total_contrib`` tracks dollars actually invested in the market.
+    total_contrib = 0.0
+
+    # Track actual dollars spent or received per ticker so that
+    # total invested reflects real cash flows instead of the intended
+    # allocation.
+    cumulative_buys = {t: 0.0 for t in tickers}
+    cumulative_sold = {t: 0.0 for t in tickers}
 
     if args.debug:
         print(
@@ -38,40 +42,46 @@ def run_simulator(args):
         print(
             f"Initial equity: {equity:.2f}, "
             f"invest fraction={args.init_invest_fraction}, "
-            f"cash={cash:.2f}"
         )
 
     # ------------------------------------------------------------------
     # Invest the specified fraction of equity on the first trading day.
-    #   invest_amt   - total dollars to invest initially
+    #   initial_invest_amt  - total dollars to invest initially
+    #                In B & H comparison bh_invest_amt does not change
+    #   cash         - uninvested portion of equity
     #   per_stock    - equal-weight amount invested into each ticker
     #   cumulative_buys/sold track dollars spent/received over time
     # ------------------------------------------------------------------
     first_pricerows = pricerows.iloc[0]
-    invest_amt = equity * args.init_invest_fraction
-    total_invest = invest_amt
-    per_stock = invest_amt / len(tickers)
-    cumulative_buys = {t: per_stock for t in tickers}
-    cumulative_sold = {t: 0 for t in tickers}
+    initial_invest_amt = equity * args.init_invest_fraction
+    per_stock = initial_invest_amt / len(tickers)
+    cash = equity  # Start with all equity as cash and reduce as each ticker is bought
     for t in tickers:
         p = first_pricerows[t]
         if pd.isna(p) or p <= 0:
             continue
         initial_shares = per_stock // p
-        shares_held[t] += initial_shares
-        cash += per_stock - initial_shares * p  # leftover fractional dollars
+        spent = per_stock
+        shares_held[t] = initial_shares
+        cumulative_buys[t] += spent
+        total_contrib += spent
+        cash -= spent
         if args.debug:
             print(f"Init buy {initial_shares:.2f} {t} at {p:.2f}")
 
     # Track month of last contribution so we know when to add more cash.
     last_contrib_month = pricerows.index[0].month
     # Curves for plotting and analysis after the simulation runs.
-    invest_curve, equity_curve, bh_curve, dates = [], [], [], []
+    # ``invest_curve`` will hold the running total of contributed capital.
+    cash_curve, invest_curve, equity_curve, bh_curve, dates = [], [], [], [], []
 
     # Buy & hold baseline: used for comparison; holds initial shares forever
     bh_shares = {t: shares_held[t] for t in tickers}
     bh_invested_each = per_stock
 
+    #-------------------------------------------------------------------
+    # TRADING
+    #-------------------------------------------------------------------
     for i, date in enumerate(pricerows.index):
         price = pricerows.iloc[i]
 
@@ -103,10 +113,12 @@ def run_simulator(args):
                 if pct_change >= args.buy_threshold:
                     buy_amt = hval * args.buy_fraction
                     shares_to_buy = min(buy_amt // p, cash // p)
+                    spent = shares_to_buy
                     if shares_to_buy > 0:
                         shares_held[t] += shares_to_buy
-                        cash -= shares_to_buy * p
-                        cumulative_buys[t] += shares_to_buy * p
+                        cash -= spent
+                        cumulative_buys[t] += spent
+                        total_contrib += spent
                         if args.debug:
                             print(f"{date.date()} BUY {shares_to_buy:.2f} {t} @ {p:.2f}")
                 elif pct_change <= -args.sell_threshold:
@@ -116,32 +128,29 @@ def run_simulator(args):
                         shares_held[t] -= shares_to_sell
                         cash += shares_to_sell * p
                         cumulative_sold[t] += shares_to_sell * p
+                        total_contrib -= spent
                         if args.debug:
                             print(f"{date.date()} SELL {shares_to_sell:.2f} {t} @ {p:.2f}")
-
+    
         # Record portfolio metrics for plotting.
-        port_val = sum(
-            shares_held[t] * price[t] for t in tickers if not pd.isna(price[t])
-        )
-        total_equity = cash + port_val
-        total_invest = sum(
-            cumulative_buys[t] - cumulative_sold[t]
-            for t in tickers
-            if not pd.isna(price[t])
-        )
-        bh_val = sum(
-            bh_shares[t] * price[t] for t in tickers if not pd.isna(price[t])
-        )
         dates.append(date)
-        invest_curve.append(total_invest)
+        invest_curve.append(total_contrib)
+        cash_curve.append(cash)
+
+        portfolio_val = sum(shares_held[t]*price[t] for t in tickers if not pd.isna(price[t]))
+        total_equity = cash + portfolio_val
         equity_curve.append(total_equity)
+        
+        # Follow equity in the B&H case
+        bh_val = sum(bh_shares[t]*price[t] for t in tickers if not pd.isna(price[t]))
         bh_curve.append(bh_val)
+
 
     # --------------------------------------------------------------
     # Final performance summary
     # --------------------------------------------------------------
     final_equity = equity_curve[-1]
-    final_invest = invest_curve[-1]
+    final_invest = invest_curve[-1]  # Same as total_contrib final value
     net_gain = final_equity - final_invest
     pct_gain = 100 * (final_equity / final_invest - 1) if final_invest > 0 else 0
 
@@ -157,11 +166,23 @@ def run_simulator(args):
 
     axs[0].plot(dates, equity_curve, label="Strategy", color="tab:blue")
     axs[0].plot(dates, bh_curve, label="Buy & Hold", color="tab:orange")
+    axs[0].plot(dates, invest_curve, label="Investment", color="black")
+    axs[0].plot(dates, cash_curve, label="Cash", color="gold")
     axs[0].set_title("Equity Curve")
     axs[0].legend()
 
-    pct_curve = np.array(equity_curve) / np.array(invest_curve) - 1
-    pct_bh = np.array(bh_curve) / invest_amt - 1
+    equity_arr = np.array(equity_curve)
+    invest_arr = np.array(invest_curve)
+    pct_curve = np.zeros_like(equity_arr)
+    valid = invest_arr > 0
+    pct_curve[valid] = equity_arr[valid] / invest_arr[valid] - 1
+
+    bh_arr = np.array(bh_curve)
+    if initial_invest_amt > 0:
+        pct_bh = bh_arr / initial_invest_amt - 1
+    else:
+        pct_bh = np.zeros_like(bh_arr)
+
     axs[1].plot(dates, pct_curve * 100, label="Strategy", color="tab:blue")
     axs[1].plot(dates, pct_bh * 100, label="Buy & Hold", color="tab:orange")
     axs[1].set_title("% Gain")
