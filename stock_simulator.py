@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import sys
 import csv
+import os
 
 def run_simulator(args):
     """Run the trading simulation using parameters from ``args``.
@@ -53,10 +54,14 @@ def run_simulator(args):
 
     # --- open trade log (overwrite each run) ---
     log_fname = args.log_file
-    log_fh = open(log_fname, "w", newline='')
-    log_writer = csv.writer(log_fh)
-    # include shares_held after ticker
-    log_writer.writerow(['date', 'ticker', 'shares_held', 'share_change', 'price', 'final_value'])
+    # ensure .txt suffix
+    if not log_fname.lower().endswith('.txt'):
+        log_fname = os.path.splitext(log_fname)[0] + '.txt'
+    log_fh = open(log_fname, "w")
+    # fixed-width header
+    header = f"{'date':<12}{'ticker':<8}{'shares_held':>12}{'share_change':>14}{'price':>14}{'final_value':>16}\n"
+    log_fh.write(header)
+    log_fh.write("-" * (len(header)-1) + "\n")
 
     if args.debug:
         print(
@@ -113,15 +118,11 @@ def run_simulator(args):
         if args.debug:
             print(f"Init buy {shares_to_buy:.2f} {t} at {p:.2f} on {initial_purchases[t]['date'].date()}")
 
-        # Log initial buy (formatted: shares 2dp, price and final value as money)
-        log_writer.writerow([
-            initial_purchases[t]['date'].date().isoformat(),
-            t,
-            f"{shares_held[t]:.2f}",
-            f"{shares_to_buy:.2f}",
-            f"${p:.2f}",
-            f"${(shares_held[t] * p):.2f}"
-        ])
+        # Log initial buy (fixed-width text)
+        price_str = f"${p:,.2f}"
+        final_str = f"${(shares_held[t] * p):,.2f}"
+        log_fh.write(f"{initial_purchases[t]['date'].date().isoformat():<12}{t:<8}"
+                     f"{shares_held[t]:12.2f}{shares_to_buy:14.2f}{price_str:14}{final_str:16}\n")
 
     # Track month of last contribution so we know when to add more cash.
     last_contrib_month = pricerows.index[0].month
@@ -205,9 +206,15 @@ def run_simulator(args):
             # Separate into buys and sells, then sort them by momentum
             buys = [trade for trade in potential_trades if trade['pct_change'] >= args.buy_threshold]
             sells = [trade for trade in potential_trades if trade['pct_change'] <= -args.sell_threshold]
-            
-            buys.sort(key=lambda x: x['pct_change'], reverse=True) # Best momentum first
-            sells.sort(key=lambda x: x['pct_change'])              # Worst momentum first
+
+            # If no buys meet the threshold, pick the single best performer
+            # provided it grew by more than 5%
+            if not buys and potential_trades:
+                best = max(potential_trades, key=lambda x: x['pct_change'])
+                if best['pct_change'] > 5.0:
+                    buys = [best]
+
+            sells.sort(key=lambda x: x['pct_change'])        # Worst momentum first
 
             # Execute sells (limit total sell proceeds to at most current cash; allow partial shares)
             initial_cash_before_sells = cash
@@ -232,15 +239,12 @@ def run_simulator(args):
                     cash += received
                     cumulative_sold[t] += received
                     remaining_sell_cap -= received
-                    # log sell (negative share change) with formatting
-                    log_writer.writerow([
-                        date.date().isoformat(),
-                        t,
-                        f"{shares_held[t]:.2f}",
-                        f"{-shares_to_sell:.2f}",
-                        f"${p:.2f}",
-                        f"${(shares_held[t] * p):.2f}"
-                    ])
+                    # log sell (fixed-width text)
+                    price_str = f"${p:,.2f}"
+                    final_str = f"${(shares_held[t] * p):,.2f}"
+                    log_fh.write(f"{date.date().isoformat():<12}{t:<8}"
+                                 f"{shares_held[t]:12.2f}{(-shares_to_sell):14.2f}"
+                                 f"{price_str:14}{final_str:16}\n")
                     if args.debug:
                         print(f"{date.date()} SELL {shares_to_sell:.2f} {t} @ {p:.2f} (change: {pct_change:.2f}%)")
                 if remaining_sell_cap <= 0.0:
@@ -249,26 +253,76 @@ def run_simulator(args):
                     break
 
             # Execute buys (best performers first)
-            for trade in buys:
-                t, p, pct_change = trade['ticker'], trade['price'], trade['pct_change']
-                hval = shares_held[t] * p
-                buy_amt = hval * args.buy_fraction
-                shares_to_buy = min(buy_amt, cash) // p
-                spent = shares_to_buy * p
-                if shares_to_buy > 0:
-                    shares_held[t] += shares_to_buy
-                    cash -= spent
-                    cumulative_buys[t] += spent
-                    # log buy (positive share change) with formatting
-                    log_writer.writerow([
-                        date.date().isoformat(),
-                        t,
-                        f"{shares_to_buy:.2f}",
-                        f"${p:.2f}",
-                        f"${(shares_held[t] * p):.2f}"
-                    ])
-                    if args.debug:
-                        print(f"{date.date()} BUY {shares_to_buy:.2f} {t} @ {p:.2f} (change: {pct_change:.2f}%)")
+            # Allocate remaining cash across buys proportional to pct_change,
+            # cap each stock's spend at hval * buy_fraction and iterate until
+            # no more caps are hit or budget exhausted.
+            buy_budget = cash
+            if buys and buy_budget > 0.0:
+                # Build list of candidates with positive momentum and valid price
+                remaining = []
+                for tr in buys:
+                    pct = max(0.0, tr['pct_change'])
+                    t = tr['ticker']
+                    p = tr['price']
+                    if p <= 0 or pd.isna(p):
+                        continue
+                    hval = shares_held[t] * p
+                    cap = hval * args.buy_fraction
+                    remaining.append({'ticker': t, 'price': p, 'pct': pct, 'cap': cap, 'allocated': 0.0})
+
+                remaining_budget = buy_budget
+                EPS = 1e-9
+                # Iterate: compute desired allocation each pass, fully allocate any items that hit cap,
+                # remove capped items and repeat until no caps or no budget left.
+                while remaining and remaining_budget > EPS:
+                    total_pct = sum(r['pct'] for r in remaining)
+                    if total_pct <= EPS:
+                        break
+
+                    # compute tentative desired allocation for this pass
+                    for r in remaining:
+                        r['desired'] = (r['pct'] / total_pct) * remaining_budget
+                        r['avail_cap'] = max(0.0, r['cap'] - r['allocated'])
+                        # tentative allocation is limited by remaining cap
+                        r['tentative'] = min(r['desired'], r['avail_cap'])
+
+                    # find items that will be capped this pass (tentative == avail_cap within EPS)
+                    capped_this_pass = [r for r in remaining if r['tentative'] >= r['avail_cap'] - EPS and r['avail_cap'] > EPS]
+
+                    if not capped_this_pass:
+                        # No caps hit: finalize tentative allocations for all and exit loop
+                        for r in remaining:
+                            spend = min(r['tentative'], remaining_budget)
+                            if spend <= EPS:
+                                continue
+                            t = r['ticker']; p = r['price']
+                            shares_to_buy = spend / p
+                            shares_held[t] += shares_to_buy
+                            cash -= spend
+                            cumulative_buys[t] += spend
+                            remaining_budget -= spend
+                            # log finalized buy
+                            log_fh.write(f"{date.date().isoformat():<12}{t:<8}{shares_held[t]:>12.2f}{shares_to_buy:>14.2f}{p:>14.2f}{(shares_held[t] * p):>16.2f}\n")
+                        break
+                    else:
+                        # Allocate full avail_cap to capped items, remove them, and continue
+                        for c in capped_this_pass:
+                            spend = min(c['avail_cap'], remaining_budget)
+                            if spend <= EPS:
+                                continue
+                            t = c['ticker']; p = c['price']
+                            shares_to_buy = spend / p
+                            shares_held[t] += shares_to_buy
+                            cash -= spend
+                            cumulative_buys[t] += spend
+                            c['allocated'] += spend
+                            remaining_budget -= spend
+                            # log capped buy
+                            log_fh.write(f"{date.date().isoformat():<12}{t:<8}{shares_held[t]:>12.2f}{shares_to_buy:>14.2f}{p:>14.2f}{(shares_held[t] * p):>16.2f}\n")
+                        # remove fully capped items
+                        remaining = [r for r in remaining if (r['cap'] - r['allocated']) > EPS]
+                        # loop continues to redistribute remaining_budget among remaining items
+            # end buy allocation
     
         # Record daily portfolio metrics for plotting.
         dates.append(date)
@@ -404,6 +458,7 @@ def run_simulator(args):
      
     # The total capital line shows initial equity plus all contributions.
     total_capital_curve = args.init_equity + np.array(cash_contrib_curve)
+    axs[0].hlines(y=0, color="black", xmin=dates[0], xmax=dates[-1], linewidth=0.8)
     axs[0].plot(dates, total_capital_curve, label="Total Capital", color="gray", linestyle="--")
     axs[0].plot(dates, invest_curve, label="Net Invested", color="green", linestyle=":")
     axs[0].plot(dates, cash_curve, label="Cash", color="gold")
@@ -531,29 +586,29 @@ if __name__ == "__main__":
                         help="CSV file containing historical price data")
     parser.add_argument("--qqq-price-file", type=str, default="qqq_prices.csv",
                         help="CSV file for QQQ B&H comparison")
-    parser.add_argument("--init-equity", type=float, default=10000,
+    parser.add_argument("--init-equity", type=float, default=15000,
                         help="Starting account equity in dollars")
     parser.add_argument("--init-invest-fraction", type=float, default=1.0,
                         help="Fraction of initial equity invested on day one")
-    parser.add_argument("--buy-fraction", type=float, default=0.60,
+    parser.add_argument("--buy-fraction", type=float, default=0.50,
                         help="Fraction of current holdings to buy when threshold met")
-    parser.add_argument("--sell-fraction", type=float, default=0.06,
+    parser.add_argument("--sell-fraction", type=float, default=0.0,
                         help="Fraction of holdings to sell when threshold met")
-    parser.add_argument("--buy-threshold", type=float, default=10.0,
+    parser.add_argument("--buy-threshold", type=float, default=20.0,
                         help="Percent price increase over the rebalance")
-    parser.add_argument("--sell-threshold", type=float, default=10.0,
+    parser.add_argument("--sell-threshold", type=float, default=20.0,
                         help="Percent price decrease to trigger sells")
-    parser.add_argument("--rebalance-days", type=int, default=21,
+    parser.add_argument("--rebalance-days", type=int, default=61,
                         help="Number of trading days between rebalances")
-    parser.add_argument("--start-date", type=str, default="2000-01-01",
+    parser.add_argument("--start-date", type=str, default="2006-01-01",
                         help="Start date for simulation (YYYY-MM-DD)")
-    parser.add_argument("--end-date", type=str, default="2100-01-01",
+    parser.add_argument("--end-date", type=str, default="2025-09-01",
                         help="End date for simulation (YYYY-MM-DD)")
-    parser.add_argument("--monthly-contribution", type=float, default=0.0,
+    parser.add_argument("--monthly-contribution", type=float, default=1000.0,
                         help="Monthly cash contribution added on month change")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug prints")
-    parser.add_argument("--log-file", type=str, default="trade_log.csv",
+    parser.add_argument("--log-file", type=str, default="trade_log.txt",
                         help="CSV file to write trade log (overwritten each run)")
     # allow unknown args from IDEs/notebooks
     args, _unknown = parser.parse_known_args()
